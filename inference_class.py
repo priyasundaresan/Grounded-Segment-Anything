@@ -9,12 +9,10 @@ import torchvision
 from torchvision.transforms import ToTensor
 
 from groundingdino.util.inference import Model
-
 from vision_utils import *
 
 import os
 from openai import OpenAI
-
 import ast
 
 class BiteAcquisitionInference:
