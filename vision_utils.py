@@ -1,14 +1,8 @@
 import cv2
-import time
-import os
 import numpy as np
-import supervision as sv
 
 import torch
-import torchvision
 from torchvision.transforms import ToTensor
-
-from groundingdino.util.inference import Model
 
 from sklearn.neighbors import NearestNeighbors
 
@@ -41,9 +35,33 @@ def efficient_sam_box_prompt_segment(image, pts_sampled, model):
 
 def outpaint_masks(target_mask, other_masks):
     for mask in other_masks:
-        ys,xs = np.where(mask > 0)
-        target_mask[ys,xs] = 0
+        target_mask = cv2.bitwise_and(cv2.bitwise_not(mask), target_mask)
+    #    ys,xs = np.where(mask > 0)
+    #    target_mask[ys,xs] = 0
     return target_mask
+
+def detect_plate(img):
+    H,W,C = img.shape
+    print("Detected plate H,W,C", H,W,C)
+    img_orig = img.copy()
+    img = cv2.resize(img, (W//2, H//2))
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray_blurred = cv2.blur(gray, (3, 3))
+    detected_circles = cv2.HoughCircles(gray_blurred,
+                       cv2.HOUGH_GRADIENT, 1, 20, param1 = 50,
+                   param2 = 30, minRadius = 30, maxRadius = 200)
+    plate_mask = np.zeros((H,W)).astype(np.uint8)
+    # Draw circles that are detected.
+    if detected_circles is not None:
+        # Convert the circle parameters a, b and r to integers.
+        detected_circles = np.uint16(np.around(detected_circles))
+        for pt in detected_circles[0, :]:
+            a, b, r = pt[0], pt[1], pt[2]
+            plate_small_mask = plate_mask.copy()
+            cv2.circle(plate_small_mask, (a*2, b*2), int(r*1.7), (255,255,255), -1)
+            plate_mask_vis = np.repeat(plate_mask[:,:,np.newaxis], 3, axis=2)
+            break
+        return plate_small_mask
 
 def detect_blue(image):
     lower_blue = np.array([60,30,15]) 
@@ -75,6 +93,7 @@ def detect_densest(mask, kernel=(60,60)):
     return densest
 
 def detect_sparsest(mask, densest):
+    cv2.imwrite('test.png', mask)
     contours,hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     length = len(contours)
     #cont = np.vstack(([c for c in contours if cv2.contourArea(c) > 100]))
@@ -101,6 +120,10 @@ def detect_centroid(mask):
     centroid = proj_pix2mask(np.array([cX, cY]), mask)
     centroid = (int(centroid[0]), int(centroid[1]))
     return centroid
+
+def mask_weight(mask):
+    H,W = mask.shape
+    return np.count_nonzero(mask)/(W*H)
 
 def cleanup_mask(mask, blur_kernel_size=(5, 5), threshold=127, erosion_size=3):
     """

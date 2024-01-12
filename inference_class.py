@@ -9,35 +9,146 @@ import torchvision
 from torchvision.transforms import ToTensor
 
 from groundingdino.util.inference import Model
-from vision_utils import *
+
+from vision_utils import detect_densest, detect_sparsest, detect_centroid, efficient_sam_box_prompt_segment, outpaint_masks, detect_blue, proj_pix2mask, cleanup_mask, visualize_keypoints, detect_plate, mask_weight
 
 import os
 from openai import OpenAI
 import ast
 
+import base64
+import requests
+
+from src.food_pos_ori_net.model.minispanet import MiniSPANet
+from src.spaghetti_segmentation.model import SegModel
+import torchvision.transforms as transforms
+
+print('imports done')
+
+class GPT4Vision:
+    def __init__(self, api_key, prompt_dir):
+
+        self.api_key = api_key
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+            }
+        self.prompt_dir = prompt_dir
+        
+        with open("%s/prompt.txt"%self.prompt_dir, 'r') as f:
+            self.prompt_text = f.read()
+        
+        self.prompt_img1 = cv2.imread("%s/11.jpg"%self.prompt_dir)
+        self.prompt_img2 = cv2.imread("%s/12.jpg"%self.prompt_dir)
+        self.prompt_img3 = cv2.imread("%s/13.jpg"%self.prompt_dir)
+
+        self.prompt_img1 = self.encode_image(self.prompt_img1)
+        self.prompt_img2 = self.encode_image(self.prompt_img2)
+        self.prompt_img3 = self.encode_image(self.prompt_img3)
+
+    def encode_image(self, openCV_image):
+        retval, buffer = cv2.imencode('.jpg', openCV_image)
+        return base64.b64encode(buffer).decode('utf-8')
+        
+    def prompt(self, image):
+        
+        # Getting the base64 string
+        base64_image = self.encode_image(image)
+
+        payload = {
+        "model": "gpt-4-vision-preview",
+        "messages": [
+            {
+            "role": "user",
+            "content": [
+                {
+                "type": "text",
+                "text": self.prompt_text
+                },
+                {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{self.prompt_img1}"
+                }
+                },
+                {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{self.prompt_img2}"
+                }
+                },
+                {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{self.prompt_img3}"
+                }
+                },
+                {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{base64_image}"
+                }
+                }
+            ]
+            }
+        ],
+        "max_tokens": 300
+        }
+
+        response = requests.post("https://api.openai.com/v1/chat/completions", headers=self.headers, json=payload)
+        response_text =  response.json()['choices'][0]["message"]["content"]
+
+        return response_text
+
 class BiteAcquisitionInference:
     def __init__(self):
         self.DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
         # GroundingDINO config and checkpoint
-        self.GROUNDING_DINO_CONFIG_PATH = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
-        self.GROUNDING_DINO_CHECKPOINT_PATH = "./groundingdino_swint_ogc.pth"
+        self.GROUNDING_DINO_CONFIG_PATH = "/scr/priyasun/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+        self.GROUNDING_DINO_CHECKPOINT_PATH = "/scr/priyasun/Grounded-Segment-Anything/groundingdino_swint_ogc.pth"
         
         # Building GroundingDINO inference model
         self.grounding_dino_model = Model(model_config_path=self.GROUNDING_DINO_CONFIG_PATH, model_checkpoint_path=self.GROUNDING_DINO_CHECKPOINT_PATH)
         
         # Building MobileSAM predictor
-        self.EFFICIENT_SAM_CHECKPOINT_PATH = "efficientsam_s_gpu.jit"
+        self.EFFICIENT_SAM_CHECKPOINT_PATH = "/scr/priyasun/Grounded-Segment-Anything/efficientsam_s_gpu.jit"
         self.efficientsam = torch.jit.load(self.EFFICIENT_SAM_CHECKPOINT_PATH)
 
-        self.FOOD_CLASSES = ["noodles", "meat", "shrimp", "chicken", "vegetable", "broccoli"]
-        self.BOX_THRESHOLD = 0.23
+        self.FOOD_CLASSES = ["noodles", "meatball", "shrimp", "chicken", "vegetable", "broccoli"]
+        self.BOX_THRESHOLD = 0.22
         self.TEXT_THRESHOLD = 0.2
-        self.NMS_THRESHOLD = 0.65
+        #self.NMS_THRESHOLD = 0.65
+        self.NMS_THRESHOLD = 0.6
 
         self.CATEGORIES = ['Meat/Seafood', 'Vegetable', 'Noodles', 'Fruit', 'Sweet Dip', 'Savory Dip']
 
-        self.api_key = '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'
+        self.api_key = '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'
+
+        self.gpt4v_client = GPT4Vision(self.api_key, '/scr/priyasun/Grounded-Segment-Anything/prompt')
         self.client = OpenAI(api_key=self.api_key)
+
+        torch.set_flush_denormal(True)
+        checkpoint_dir = 'spaghetti_checkpoints'
+
+        self.recenterrotnet = MiniSPANet(out_features=1)
+        self.recenterrotnet_crop_size = 100
+        checkpoint = torch.load('%s/spaghetti_ori_net.pth'%checkpoint_dir, map_location=self.DEVICE)
+        self.recenterrotnet.load_state_dict(checkpoint)
+        self.recenterrotnet.eval()
+        self.recenterrotnet_transform = transforms.Compose([transforms.ToTensor()])
+
+        self.seg_net = SegModel("FPN", "resnet34", in_channels=3, out_classes=1)
+        ckpt = torch.load('%s/spaghetti_seg_resnet.pth'%checkpoint_dir, map_location=self.DEVICE)
+        self.seg_net.load_state_dict(ckpt)
+        self.seg_net.eval()
+        self.seg_net.to(self.DEVICE)
+        self.seg_net_transform = transforms.Compose([transforms.ToTensor()])
+
+    def recognize_items(self, image):
+        response = self.gpt4v_client.prompt(image).strip()
+        items = ast.literal_eval(response)
+        return items
 
     def chat_with_openai(self, prompt):
         """
@@ -58,7 +169,33 @@ class BiteAcquisitionInference:
         chatbot_response = response.choices[0].message.content
         return chatbot_response.strip()
 
+        #crops = []
+        #labels = []
+        #H,W,C = image.shape
+        #for box, class_id in zip(detections.xyxy, detections.class_id):
+        #    x,y,x1,y1 = box
+        #    crop = image[int(y):int(y1),int(x):int(x1)]
+        #    crops.append(crop)
+        #    label = self.FOOD_CLASSES[class_id]
+        #    #if 'shrimp' in label or 'chicken' in label or 'meat' in label:
+        #    #    new_detections = self.grounding_dino_model.predict_with_classes(
+        #    #        image=crop,
+        #    #        classes=self.MEAT_CLASSES,
+        #    #        box_threshold=self.BOX_THRESHOLD,
+        #    #        text_threshold=self.TEXT_THRESHOLD
+        #    #    )
+        #    #    for c in new_detections.class_id:
+        #    #        label = self.MEAT_CLASSES[c]
+        #    #        break
+        #    labels.append(label)
+        #return crops, labels
+
+
     def detect_items(self, image):
+
+        self.FOOD_CLASSES = [f.replace('fettucine', 'noodles') for f in self.FOOD_CLASSES]
+        self.FOOD_CLASSES = [f.replace('spaghetti', 'noodles') for f in self.FOOD_CLASSES]
+
         # detect objects
         detections = self.grounding_dino_model.predict_with_classes(
             image=image,
@@ -105,13 +242,15 @@ class BiteAcquisitionInference:
             for _, _, confidence, class_id, _ 
             in detections]
 
-
         annotated_image = mask_annotator.annotate(scene=image.copy(), detections=detections)
         annotated_image = box_annotator.annotate(scene=annotated_image, detections=detections, labels=labels)
 
         blue_mask = detect_blue(image.copy())
 
         individual_masks = []
+        noodle_idx = 0
+
+        print(self.FOOD_CLASSES)
         for i in range(len(detections)):
             mask_annotator = sv.MaskAnnotator(color=sv.Color.white())
             H,W,C = image.shape
@@ -124,19 +263,39 @@ class BiteAcquisitionInference:
             ys,xs,_ = np.where(mask > (0,0,0))
             binary_mask[ys,xs] = 255
             individual_masks.append(binary_mask)
+            if 'noodle' in labels[i] or 'fettucine' in labels[i] or 'spaghetti' in labels[i]:
+                noodle_idx = i
+                noodle_mask = binary_mask
 
-        noodle_mask = individual_masks[0]
-        noodle_mask = cv2.bitwise_and(cv2.bitwise_not(blue_mask), noodle_mask)
-        noodle_mask = outpaint_masks(noodle_mask, individual_masks[1:])
-        individual_masks[0] = noodle_mask
-        individual_masks = [cleanup_mask(mask) for mask in individual_masks]
+        plate_mask = detect_plate(image)
+
+        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        inp = self.seg_net_transform(img_rgb).to(device=self.DEVICE)
+        logits = self.seg_net(inp)
+        pr_mask = logits.sigmoid().detach().cpu().numpy().reshape(H,W,1)
+        noodle_vapors_mask = cv2.normalize(pr_mask, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        noodle_mask = cv2.bitwise_and(plate_mask, noodle_mask)
+        noodle_mask = cv2.bitwise_and(noodle_vapors_mask, noodle_mask)
+        noodle_mask = outpaint_masks(noodle_mask.copy(), individual_masks[:noodle_idx] + individual_masks[noodle_idx+1:])
+        individual_masks[noodle_idx] = noodle_mask
+
+        individual_masks.append(plate_mask)
+        labels.append('blue plate')
+
+        refined_masks = []
+        portion_weights = []
+
+        for mask in individual_masks:
+            refined_masks.append(cleanup_mask(mask))
+            portion_weights.append(mask_weight(mask))
+        #individual_masks = [cleanup_mask(mask) for mask in individual_masks]
 
         densest = detect_densest(noodle_mask)
         sparsest = detect_sparsest(noodle_mask, densest)
 
+        #visualized_masks = individual_masks.copy()
         visualized_masks = []
-        #visualized_masks = [blue_mask]
-        for i, mask in enumerate(individual_masks):
+        for i, mask in enumerate(refined_masks):
             if 'noodle' in labels[i]:
                 vis = visualize_keypoints(mask.copy(), [densest, sparsest])
             else:
@@ -144,8 +303,13 @@ class BiteAcquisitionInference:
                 vis = visualize_keypoints(mask.copy(), [centroid])
             visualized_masks.append(vis)
 
-        #return annotated_image, individual_masks, labels
-        return annotated_image, visualized_masks, labels
+        keypoints = [sparsest, densest]
+        min_weight = min(portion_weights)
+        portion_weights = [p/min_weight for p in portion_weights]
+
+        print(labels[:-1], portion_weights[:-1])
+
+        return annotated_image, visualized_masks, labels, keypoints
 
     def categorize_items(self, labels):
         food_item_count = {c:0 for c in self.CATEGORIES}
@@ -246,18 +410,29 @@ class BiteAcquisitionInference:
 
 if __name__ == '__main__':
     inference_server = BiteAcquisitionInference()
-    inference_server.score_bites_preference()
 
-    #SOURCE_IMAGE_DIR = 'test_images'
-    #OUTPUT_DIR = 'outputs'
+    SOURCE_IMAGE_DIR = 'test_images'
+    OUTPUT_DIR = 'outputs'
 
-    #if not os.path.exists(OUTPUT_DIR):
-    #    os.mkdir(OUTPUT_DIR)
+    if not os.path.exists(OUTPUT_DIR):
+        os.mkdir(OUTPUT_DIR)
+
+    for i, fn in enumerate(os.listdir(SOURCE_IMAGE_DIR)):
+        SOURCE_IMAGE_PATH = os.path.join(SOURCE_IMAGE_DIR, fn)
+        image = cv2.imread(SOURCE_IMAGE_PATH)
+
+        items = inference_server.recognize_items(image)
+        inference_server.FOOD_CLASSES = items
+
+        annotated_image, masks, labels, _ = inference_server.detect_items(image)
+        cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_all.jpg'%(i)), annotated_image)
+        for j in range(len(masks)):
+            cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_%s.jpg'%(i,labels[j])), masks[j])
 
     #for i, fn in enumerate(os.listdir(SOURCE_IMAGE_DIR)):
     #    SOURCE_IMAGE_PATH = os.path.join(SOURCE_IMAGE_DIR, fn)
     #    image = cv2.imread(SOURCE_IMAGE_PATH)
-    #    annotated_image, masks, labels = inference_server.detect_items(image)
+    #    annotated_image, masks, labels, _ = inference_server.detect_items(image)
     #    #inference_server.categorize_items(labels)
     #    for j in range(len(masks)):
     #        cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_%s.jpg'%(i,labels[j])), masks[j])
