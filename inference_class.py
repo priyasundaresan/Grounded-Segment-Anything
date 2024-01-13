@@ -18,6 +18,8 @@ import ast
 
 import base64
 import requests
+import cmath
+import math
 
 from src.food_pos_ori_net.model.minispanet import MiniSPANet
 from src.spaghetti_segmentation.model import SegModel
@@ -131,12 +133,12 @@ class BiteAcquisitionInference:
         torch.set_flush_denormal(True)
         checkpoint_dir = 'spaghetti_checkpoints'
 
-        self.recenterrotnet = MiniSPANet(out_features=1)
-        self.recenterrotnet_crop_size = 100
+        self.minispanet = MiniSPANet(out_features=1)
+        self.minispanet_crop_size = 100
         checkpoint = torch.load('%s/spaghetti_ori_net.pth'%checkpoint_dir, map_location=self.DEVICE)
-        self.recenterrotnet.load_state_dict(checkpoint)
-        self.recenterrotnet.eval()
-        self.recenterrotnet_transform = transforms.Compose([transforms.ToTensor()])
+        self.minispanet.load_state_dict(checkpoint)
+        self.minispanet.eval()
+        self.minispanet_transform = transforms.Compose([transforms.ToTensor()])
 
         self.seg_net = SegModel("FPN", "resnet34", in_channels=3, out_classes=1)
         ckpt = torch.load('%s/spaghetti_seg_resnet.pth'%checkpoint_dir, map_location=self.DEVICE)
@@ -190,9 +192,70 @@ class BiteAcquisitionInference:
         #    labels.append(label)
         #return crops, labels
 
+    def run_minispanet_inference(self, u, v, cv_img, crop_dim=15):
+        cv_crop = cv_img[v-crop_dim:v+crop_dim, u-crop_dim:u+crop_dim]
+        cv_crop_resized = cv2.resize(cv_crop, (self.minispanet_crop_size, self.minispanet_crop_size))
+        rescale_factor = cv_crop.shape[0]/self.minispanet_crop_size
+
+        img_t = self.minispanet_transform(cv_crop_resized)
+        img_t = img_t.unsqueeze(0)
+        H,W = self.minispanet_crop_size, self.minispanet_crop_size
+
+        heatmap, pred = self.minispanet(img_t)
+
+        heatmap = heatmap.detach().cpu().numpy()
+        pred_rot = pred.detach().cpu().numpy().squeeze()
+
+        heatmap = heatmap[0][0]
+        pred_x, pred_y = self.minispanet_crop_size//2, self.minispanet_crop_size//2
+        heatmap = cv2.normalize(heatmap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+        heatmap = cv2.addWeighted(cv_crop_resized, 0.55, heatmap, 0.45, 0)
+        cv2.circle(heatmap, (pred_x,pred_y), 2, (255,255,255), -1)
+        cv2.circle(heatmap, (W//2,H//2), 2, (0,0,0), -1)
+        pt = cmath.rect(20, np.pi/2-pred_rot)  
+        x2 = int(pt.real)
+        y2 = int(pt.imag)
+        rot_vis = cv2.line(cv_crop_resized, (pred_x-x2,pred_y+y2), (pred_x+x2, pred_y-y2), (255,255,255), 2)
+        cv2.putText(heatmap,"Skewer Point",(20,20),cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,255),1)
+        cv2.putText(rot_vis,"Skewer Angle",(20,20),cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,255),1)
+        cv2.circle(rot_vis, (pred_x,pred_y), 4, (255,255,255), -1)
+        result = rot_vis
+
+        global_x = u + pred_x*rescale_factor
+        global_y = v + pred_y*rescale_factor
+        pred_rot = math.degrees(pred_rot)
+        return pred_rot, int(global_x), int(global_y), result
+
+    def get_noodle_action(self, image, masks, labels):
+        H,W,C = image.shape
+        plate_mask = masks[-1]
+        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        inp = self.seg_net_transform(img_rgb).to(device=self.DEVICE)
+        logits = self.seg_net(inp)
+        pr_mask = logits.sigmoid().detach().cpu().numpy().reshape(H,W,1)
+        noodle_vapors_mask = cv2.normalize(pr_mask, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+        noodle_idx = None
+        noodle_mask = None
+
+        for i, (label, mask) in enumerate(zip(labels, masks)):
+            if 'noodle' in labels[i] or 'fettucine' in labels[i] or 'spaghetti' in labels[i]:
+                noodle_idx = i
+                noodle_mask = mask
+
+        noodle_mask = cv2.bitwise_and(plate_mask, noodle_mask)
+        noodle_mask = cv2.bitwise_and(noodle_vapors_mask, noodle_mask)
+        noodle_mask = outpaint_masks(noodle_mask.copy(), masks[:noodle_idx] + masks[noodle_idx+1:-1])
+        densest = detect_densest(noodle_mask)
+        sparsest = detect_sparsest(noodle_mask, densest)
+        twirl_angle, _, _, minispanet_vis = self.run_minispanet_inference(densest[0], sparsest[1], image)
+
+        #cv2.imshow('img', minispanet_vis)
+        #cv2.waitKey(0)
+        return densest, sparsest, noodle_mask
 
     def detect_items(self, image):
-
         self.FOOD_CLASSES = [f.replace('fettucine', 'noodles') for f in self.FOOD_CLASSES]
         self.FOOD_CLASSES = [f.replace('spaghetti', 'noodles') for f in self.FOOD_CLASSES]
 
@@ -248,9 +311,8 @@ class BiteAcquisitionInference:
         blue_mask = detect_blue(image.copy())
 
         individual_masks = []
-        noodle_idx = 0
 
-        print(self.FOOD_CLASSES)
+        #print(self.FOOD_CLASSES)
         for i in range(len(detections)):
             mask_annotator = sv.MaskAnnotator(color=sv.Color.white())
             H,W,C = image.shape
@@ -263,53 +325,41 @@ class BiteAcquisitionInference:
             ys,xs,_ = np.where(mask > (0,0,0))
             binary_mask[ys,xs] = 255
             individual_masks.append(binary_mask)
-            if 'noodle' in labels[i] or 'fettucine' in labels[i] or 'spaghetti' in labels[i]:
-                noodle_idx = i
-                noodle_mask = binary_mask
+            #if 'noodle' in labels[i] or 'fettucine' in labels[i] or 'spaghetti' in labels[i]:
+            #    noodle_idx = i
+            #    noodle_mask = binary_mask
 
         plate_mask = detect_plate(image)
 
-        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        inp = self.seg_net_transform(img_rgb).to(device=self.DEVICE)
-        logits = self.seg_net(inp)
-        pr_mask = logits.sigmoid().detach().cpu().numpy().reshape(H,W,1)
-        noodle_vapors_mask = cv2.normalize(pr_mask, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        noodle_mask = cv2.bitwise_and(plate_mask, noodle_mask)
-        noodle_mask = cv2.bitwise_and(noodle_vapors_mask, noodle_mask)
-        noodle_mask = outpaint_masks(noodle_mask.copy(), individual_masks[:noodle_idx] + individual_masks[noodle_idx+1:])
-        individual_masks[noodle_idx] = noodle_mask
+        #if noodle_mask is not None:
+        #    other_masks = individual_masks[:noodle_idx] + individual_masks[noodle_idx+1:])
+        #    densest, sparsest, noodle_mask = self.get_noodle_action(image, noodle_mask, other_masks, plate_mask)
+        #    individual_masks[noodle_idx] = noodle_mask
 
         individual_masks.append(plate_mask)
         labels.append('blue plate')
 
         refined_masks = []
-        portion_weights = []
-
+        #portion_weights = []
         for mask in individual_masks:
             refined_masks.append(cleanup_mask(mask))
-            portion_weights.append(mask_weight(mask))
-        #individual_masks = [cleanup_mask(mask) for mask in individual_masks]
+        #    portion_weights.append(mask_weight(mask))
 
-        densest = detect_densest(noodle_mask)
-        sparsest = detect_sparsest(noodle_mask, densest)
+        #visualized_masks = []
+        #for i, mask in enumerate(refined_masks):
+        #    if 'noodle' in labels[i]:
+        #        vis = visualize_keypoints(mask.copy(), [densest, sparsest])
+        #    else:
+        #        centroid = detect_centroid(mask)
+        #        vis = visualize_keypoints(mask.copy(), [centroid])
+        #    visualized_masks.append(vis)
 
-        #visualized_masks = individual_masks.copy()
-        visualized_masks = []
-        for i, mask in enumerate(refined_masks):
-            if 'noodle' in labels[i]:
-                vis = visualize_keypoints(mask.copy(), [densest, sparsest])
-            else:
-                centroid = detect_centroid(mask)
-                vis = visualize_keypoints(mask.copy(), [centroid])
-            visualized_masks.append(vis)
+        #keypoints = [sparsest, densest]
+        #min_weight = min(portion_weights)
+        #portion_weights = [p/min_weight for p in portion_weights]
 
-        keypoints = [sparsest, densest]
-        min_weight = min(portion_weights)
-        portion_weights = [p/min_weight for p in portion_weights]
-
-        print(labels[:-1], portion_weights[:-1])
-
-        return annotated_image, visualized_masks, labels, keypoints
+        #return annotated_image, visualized_masks, labels, keypoints
+        return annotated_image, refined_masks, labels
 
     def categorize_items(self, labels):
         food_item_count = {c:0 for c in self.CATEGORIES}
@@ -421,10 +471,14 @@ if __name__ == '__main__':
         SOURCE_IMAGE_PATH = os.path.join(SOURCE_IMAGE_DIR, fn)
         image = cv2.imread(SOURCE_IMAGE_PATH)
 
-        items = inference_server.recognize_items(image)
-        inference_server.FOOD_CLASSES = items
+        #items = inference_server.recognize_items(image)
+        #inference_server.FOOD_CLASSES = items
 
-        annotated_image, masks, labels, _ = inference_server.detect_items(image)
+        annotated_image, masks, labels = inference_server.detect_items(image)
+
+        inference_server.get_noodle_action(image, masks, labels)
+
+        break
         cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_all.jpg'%(i)), annotated_image)
         for j in range(len(masks)):
             cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_%s.jpg'%(i,labels[j])), masks[j])
