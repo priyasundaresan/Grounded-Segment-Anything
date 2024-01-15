@@ -72,6 +72,13 @@ def detect_blue(image):
     mask = cv2.inRange(image, lower_blue, upper_blue)
     return mask
 
+def nearest_neighbor(points, target_point):
+    points = np.array(points)
+    neigh = NearestNeighbors()
+    neigh.fit(points)
+    dists, idxs = neigh.kneighbors(np.array(target_point).reshape(1,-1), 1, return_distance=True)
+    return points[idxs.squeeze()]
+
 def proj_pix2mask(px, mask):
     ys, xs = np.where(mask > 0)
     if not len(ys):
@@ -106,7 +113,7 @@ def detect_sparsest(mask, densest):
     furthest = hull[idxs.squeeze()[-1]]
     furthest = proj_pix2mask(np.array(furthest), mask)
     furthest = (int(furthest[0]), int(furthest[1]))
-    return furthest
+    return furthest, hull
 
 def detect_centroid(mask):
     cX, cY = 0, 0
@@ -145,7 +152,11 @@ def cleanup_mask(mask, blur_kernel_size=(5, 5), threshold=127, erosion_size=3):
     eroded = cv2.erode(thresholded, erosion_kernel, iterations=1)
     return eroded
 
-def visualize_keypoints(image, keypoints):
+def visualize_push(image, start, end):
+    vis = cv2.arrowedLine(image.copy(), tuple(start), tuple(end), (255,255,255), 3)
+    return vis
+
+def visualize_keypoints(image, keypoints, color=(255,255,255), radius=8):
     for k in keypoints:
-        cv2.circle(image, k, 10, (100,100,100), -1)
+        cv2.circle(image, tuple(k), radius, color, -1)
     return image

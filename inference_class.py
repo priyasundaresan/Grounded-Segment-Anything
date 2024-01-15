@@ -10,7 +10,7 @@ from torchvision.transforms import ToTensor
 
 from groundingdino.util.inference import Model
 
-from vision_utils import detect_densest, detect_sparsest, detect_centroid, efficient_sam_box_prompt_segment, outpaint_masks, detect_blue, proj_pix2mask, cleanup_mask, visualize_keypoints, detect_plate, mask_weight
+from vision_utils import detect_densest, detect_sparsest, detect_centroid, efficient_sam_box_prompt_segment, outpaint_masks, detect_blue, proj_pix2mask, cleanup_mask, visualize_keypoints, visualize_push, detect_plate, mask_weight, nearest_neighbor
 
 import os
 from openai import OpenAI
@@ -40,13 +40,13 @@ class GPT4Vision:
         with open("%s/prompt.txt"%self.prompt_dir, 'r') as f:
             self.prompt_text = f.read()
         
-        self.prompt_img1 = cv2.imread("%s/11.jpg"%self.prompt_dir)
-        self.prompt_img2 = cv2.imread("%s/12.jpg"%self.prompt_dir)
-        self.prompt_img3 = cv2.imread("%s/13.jpg"%self.prompt_dir)
+        self.detection_prompt_img1 = cv2.imread("%s/detection/11.jpg"%self.prompt_dir)
+        self.detection_prompt_img2 = cv2.imread("%s/detection/12.jpg"%self.prompt_dir)
+        self.detection_prompt_img3 = cv2.imread("%s/detection/13.jpg"%self.prompt_dir)
 
-        self.prompt_img1 = self.encode_image(self.prompt_img1)
-        self.prompt_img2 = self.encode_image(self.prompt_img2)
-        self.prompt_img3 = self.encode_image(self.prompt_img3)
+        self.detection_prompt_img1 = self.encode_image(self.detection_prompt_img1)
+        self.detection_prompt_img2 = self.encode_image(self.detection_prompt_img2)
+        self.detection_prompt_img3 = self.encode_image(self.detection_prompt_img3)
 
     def encode_image(self, openCV_image):
         retval, buffer = cv2.imencode('.jpg', openCV_image)
@@ -70,19 +70,19 @@ class GPT4Vision:
                 {
                 "type": "image_url",
                 "image_url": {
-                    "url": f"data:image/jpeg;base64,{self.prompt_img1}"
+                    "url": f"data:image/jpeg;base64,{self.detection_prompt_img1}"
                 }
                 },
                 {
                 "type": "image_url",
                 "image_url": {
-                    "url": f"data:image/jpeg;base64,{self.prompt_img2}"
+                    "url": f"data:image/jpeg;base64,{self.detection_prompt_img2}"
                 }
                 },
                 {
                 "type": "image_url",
                 "image_url": {
-                    "url": f"data:image/jpeg;base64,{self.prompt_img3}"
+                    "url": f"data:image/jpeg;base64,{self.detection_prompt_img3}"
                 }
                 },
                 {
@@ -123,9 +123,9 @@ class BiteAcquisitionInference:
         #self.NMS_THRESHOLD = 0.65
         self.NMS_THRESHOLD = 0.6
 
-        self.CATEGORIES = ['Meat/Seafood', 'Vegetable', 'Noodles', 'Fruit', 'Sweet Dip', 'Savory Dip']
+        self.CATEGORIES = ['meat/seafood', 'vegetable', 'noodles', 'fruit', 'dip', 'plate']
 
-        self.api_key = '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'
+        self.api_key = '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'
 
         self.gpt4v_client = GPT4Vision(self.api_key, '/scr/priyasun/Grounded-Segment-Anything/prompt')
         self.client = OpenAI(api_key=self.api_key)
@@ -171,27 +171,6 @@ class BiteAcquisitionInference:
         chatbot_response = response.choices[0].message.content
         return chatbot_response.strip()
 
-        #crops = []
-        #labels = []
-        #H,W,C = image.shape
-        #for box, class_id in zip(detections.xyxy, detections.class_id):
-        #    x,y,x1,y1 = box
-        #    crop = image[int(y):int(y1),int(x):int(x1)]
-        #    crops.append(crop)
-        #    label = self.FOOD_CLASSES[class_id]
-        #    #if 'shrimp' in label or 'chicken' in label or 'meat' in label:
-        #    #    new_detections = self.grounding_dino_model.predict_with_classes(
-        #    #        image=crop,
-        #    #        classes=self.MEAT_CLASSES,
-        #    #        box_threshold=self.BOX_THRESHOLD,
-        #    #        text_threshold=self.TEXT_THRESHOLD
-        #    #    )
-        #    #    for c in new_detections.class_id:
-        #    #        label = self.MEAT_CLASSES[c]
-        #    #        break
-        #    labels.append(label)
-        #return crops, labels
-
     def run_minispanet_inference(self, u, v, cv_img, crop_dim=15):
         cv_crop = cv_img[v-crop_dim:v+crop_dim, u-crop_dim:u+crop_dim]
         cv_crop_resized = cv2.resize(cv_crop, (self.minispanet_crop_size, self.minispanet_crop_size))
@@ -227,7 +206,28 @@ class BiteAcquisitionInference:
         pred_rot = math.degrees(pred_rot)
         return pred_rot, int(global_x), int(global_y), result
 
-    def get_noodle_action(self, image, masks, labels):
+    def check_noodle_action_validity(self, image, sparsest, densest, filling_push_start, filling_push_end):
+        if filling_push_start is None and filling_push_end is None:
+            return ['Twirl', 'Group']
+        H,W,C = image.shape
+        vis = np.zeros((H,W))
+
+        filling_push_mask = visualize_keypoints(vis.copy(), [filling_push_start], radius=12)
+        group_mask = visualize_push(vis.copy(), sparsest, densest)
+        twirl_mask = visualize_keypoints(vis.copy(), [densest], radius=20)
+
+        valid_actions = ['Push Filling']
+        if not (np.any(cv2.bitwise_and(filling_push_mask, twirl_mask))):
+            valid_actions.append('Twirl')
+        if not (np.any(cv2.bitwise_and(filling_push_mask, group_mask))):
+            valid_actions.append('Group')
+
+        #cv2.imshow('vis', np.hstack((filling_push_mask, group_mask, twirl_mask)))
+        #cv2.waitKey(0)
+        return valid_actions
+
+    def get_noodle_action(self, image, masks, labels, categories):
+        # Extract mask of only noodles
         H,W,C = image.shape
         plate_mask = masks[-1]
         img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -235,25 +235,58 @@ class BiteAcquisitionInference:
         logits = self.seg_net(inp)
         pr_mask = logits.sigmoid().detach().cpu().numpy().reshape(H,W,1)
         noodle_vapors_mask = cv2.normalize(pr_mask, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
         noodle_idx = None
         noodle_mask = None
-
         for i, (label, mask) in enumerate(zip(labels, masks)):
             if 'noodle' in labels[i] or 'fettucine' in labels[i] or 'spaghetti' in labels[i]:
                 noodle_idx = i
                 noodle_mask = mask
-
         noodle_mask = cv2.bitwise_and(plate_mask, noodle_mask)
         noodle_mask = cv2.bitwise_and(noodle_vapors_mask, noodle_mask)
         noodle_mask = outpaint_masks(noodle_mask.copy(), masks[:noodle_idx] + masks[noodle_idx+1:-1])
+
+        # Detect densest and furthest points
         densest = detect_densest(noodle_mask)
-        sparsest = detect_sparsest(noodle_mask, densest)
+        sparsest, sparsest_candidates = detect_sparsest(noodle_mask, densest)
+
+        # Detect twirl angle
         twirl_angle, _, _, minispanet_vis = self.run_minispanet_inference(densest[0], sparsest[1], image)
 
+        filling_centroids = []
+        filling_push_start = None
+        filling_push_end = None
+
+        for i, (category, mask) in enumerate(zip(categories, masks)):
+            if category in ['meat/seafood', 'vegetable']:
+                centroid = detect_centroid(masks[i])
+                filling_centroids.append(centroid)
+
+        vis = image.copy()
+        if len(filling_centroids):
+            nearest_filling_centroid = nearest_neighbor(filling_centroids, densest)
+            #filling_push_end = nearest_neighbor(sparsest_candidates, filling_push_start)
+            direction = np.array(sparsest) - np.array(densest)
+            direction = direction / np.linalg.norm(direction)
+            direction = np.array([-direction[1], direction[0]])
+            direction = (50*(direction)).astype(int)
+            #filling_push_end = filling_push_start + direction
+
+            filling_push_end = nearest_neighbor(sparsest_candidates, nearest_filling_centroid + direction)
+            offset = filling_push_end - nearest_filling_centroid
+            offset = 30*(offset / np.linalg.norm(offset))
+            filling_push_start = np.array(nearest_filling_centroid - offset).astype(int)
+
+            vis = visualize_push(vis, filling_push_start, filling_push_end)
+        vis = visualize_push(vis, sparsest, densest)
+
+        valid_actions = self.check_noodle_action_validity(image, sparsest, densest, nearest_filling_centroid, filling_push_end)
+        #print(valid_actions)
+        cv2.imshow('img', vis)
+        cv2.waitKey(0)
         #cv2.imshow('img', minispanet_vis)
         #cv2.waitKey(0)
-        return densest, sparsest, noodle_mask
+        
+        return densest, sparsest, noodle_mask, valid_actions
 
     def detect_items(self, image):
         self.FOOD_CLASSES = [f.replace('fettucine', 'noodles') for f in self.FOOD_CLASSES]
@@ -340,6 +373,7 @@ class BiteAcquisitionInference:
         labels.append('blue plate')
 
         refined_masks = []
+
         #portion_weights = []
         for mask in individual_masks:
             refined_masks.append(cleanup_mask(mask))
@@ -362,59 +396,58 @@ class BiteAcquisitionInference:
         return annotated_image, refined_masks, labels
 
     def categorize_items(self, labels):
-        food_item_count = {c:0 for c in self.CATEGORIES}
+        categories = []
         prompt = """
                  Input: 'noodles 0.69'
-                 Output: 'Noodles'
+                 Output: 'noodles'
 
                  Input: 'shrimp 0.26'
-                 Output: 'Meat/Seafood'
+                 Output: 'meat/seafood'
 
                  Input: 'meat 0.46'
-                 Output: 'Meat/Seafood'
+                 Output: 'meat/seafood'
 
                  Input: 'broccoli 0.42'
-                 Output: 'Vegetable'
+                 Output: 'vegetable'
 
                  Input: 'celery 0.69'
-                 Output: 'Vegetable'
+                 Output: 'vegetable'
 
                  Input: 'chicken 0.27'
-                 Output: 'Meat/Seafood'
+                 Output: 'meat/seafood'
 
                  Input: 'ketchup 0.47'
-                 Output: 'Savory Dip'
+                 Output: 'dip'
 
                  Input: 'ranch 0.24'
-                 Output: 'Savory Dip'
+                 Output: 'dip'
 
                  Input: 'caramel 0.28'
-                 Output: 'Sweet Dip'
+                 Output: 'dip'
 
                  Input: 'chocolate sauce 0.24'
-                 Output: 'Sweet Dip'
+                 Output: 'dip'
 
                  Input: 'strawberry 0.57'
-                 Output: 'Fruit'
+                 Output: 'fruit'
+
+                 Input: 'blue plate'
+                 Output: 'plate'
+
+                 Input: 'blue plate'
+                 Output: 'plate'
 
                  Input: 'blueberry 0.87'
-                 Output: 'Fruit'
+                 Output: 'fruit'
 
                  Input: '%s'
                  Output:
                  """
         for label in labels:
             predicted_category = self.chat_with_openai(prompt%label).strip().replace("'",'')
-            food_item_count[predicted_category] += 1
+            categories.append(predicted_category)
 
-        #for label in labels:
-        #    request = Request(model="openai/text-davinci-003", prompt=prompt%label, random=0)
-        #    request_result = self.service.make_request(self.auth, request)
-        #    completion = request_result.completions[0].text.strip()
-        #    print(label, completion)
-
-        #print(food_item_count)
-        return food_item_count
+        return categories
 
     def score_bites_preference(self):
         prompt = """
@@ -475,19 +508,15 @@ if __name__ == '__main__':
         #inference_server.FOOD_CLASSES = items
 
         annotated_image, masks, labels = inference_server.detect_items(image)
+        categories = inference_server.categorize_items(labels)
 
-        inference_server.get_noodle_action(image, masks, labels)
+        #print(labels)
+        #print(categories)
+        inference_server.get_noodle_action(image, masks, labels, categories)
 
-        break
-        cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_all.jpg'%(i)), annotated_image)
-        for j in range(len(masks)):
-            cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_%s.jpg'%(i,labels[j])), masks[j])
+        if i > 3:
+            break
 
-    #for i, fn in enumerate(os.listdir(SOURCE_IMAGE_DIR)):
-    #    SOURCE_IMAGE_PATH = os.path.join(SOURCE_IMAGE_DIR, fn)
-    #    image = cv2.imread(SOURCE_IMAGE_PATH)
-    #    annotated_image, masks, labels, _ = inference_server.detect_items(image)
-    #    #inference_server.categorize_items(labels)
-    #    for j in range(len(masks)):
-    #        cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_%s.jpg'%(i,labels[j])), masks[j])
-    #        cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_all.jpg'%(i)), annotated_image)
+        #cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_all.jpg'%(i)), annotated_image)
+        #for j in range(len(masks)):
+        #    cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_%s.jpg'%(i,labels[j])), masks[j])
