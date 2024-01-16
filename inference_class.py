@@ -10,7 +10,7 @@ from torchvision.transforms import ToTensor
 
 from groundingdino.util.inference import Model
 
-from vision_utils import detect_densest, detect_sparsest, detect_centroid, efficient_sam_box_prompt_segment, outpaint_masks, detect_blue, proj_pix2mask, cleanup_mask, visualize_keypoints, visualize_push, detect_plate, mask_weight, nearest_neighbor
+from vision_utils import detect_densest, detect_sparsest, detect_centroid, detect_filling_push, efficient_sam_box_prompt_segment, outpaint_masks, detect_blue, proj_pix2mask, cleanup_mask, visualize_keypoints, visualize_push, detect_plate, mask_weight, nearest_neighbor, nearest_point_to_mask
 
 import os
 from openai import OpenAI
@@ -125,13 +125,13 @@ class BiteAcquisitionInference:
 
         self.CATEGORIES = ['meat/seafood', 'vegetable', 'noodles', 'fruit', 'dip', 'plate']
 
-        self.api_key = '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'
+        self.api_key = ''
 
         self.gpt4v_client = GPT4Vision(self.api_key, '/scr/priyasun/Grounded-Segment-Anything/prompt')
         self.client = OpenAI(api_key=self.api_key)
 
         torch.set_flush_denormal(True)
-        checkpoint_dir = 'spaghetti_checkpoints'
+        checkpoint_dir = '/scr/priyasun/Grounded-Segment-Anything/spaghetti_checkpoints'
 
         self.minispanet = MiniSPANet(out_features=1)
         self.minispanet_crop_size = 100
@@ -260,33 +260,36 @@ class BiteAcquisitionInference:
             if category in ['meat/seafood', 'vegetable']:
                 centroid = detect_centroid(masks[i])
                 filling_centroids.append(centroid)
-
+        
         vis = image.copy()
         if len(filling_centroids):
-            nearest_filling_centroid = nearest_neighbor(filling_centroids, densest)
-            #filling_push_end = nearest_neighbor(sparsest_candidates, filling_push_start)
-            direction = np.array(sparsest) - np.array(densest)
-            direction = direction / np.linalg.norm(direction)
-            direction = np.array([-direction[1], direction[0]])
-            direction = (50*(direction)).astype(int)
-            #filling_push_end = filling_push_start + direction
+            filling_push_start, filling_push_end = detect_filling_push(densest, sparsest, filling_centroids, sparsest_candidates)
+            #vis = visualize_push(vis, filling_push_start, filling_push_end)
+        #vis = visualize_push(vis, sparsest, densest)
+    
+        #vis = image.copy()
+        #if len(filling_centroids):
+        #    group_mask = visualize_push(np.zeros((H,W)).astype(np.uint8), sparsest, densest)
+        #    nearest_filling_centroid = nearest_point_to_mask(filling_centroids, group_mask)
+        #    direction = np.array(sparsest) - np.array(densest)
+        #    direction = direction / np.linalg.norm(direction)
+        #    direction = np.array([-direction[1], direction[0]])
+        #    direction = (50*(direction)).astype(int)
+        #    filling_push_end = nearest_filling_centroid + direction
 
-            filling_push_end = nearest_neighbor(sparsest_candidates, nearest_filling_centroid + direction)
-            offset = filling_push_end - nearest_filling_centroid
-            offset = 30*(offset / np.linalg.norm(offset))
-            filling_push_start = np.array(nearest_filling_centroid - offset).astype(int)
+        #    #filling_push_end = nearest_neighbor(sparsest_candidates, nearest_filling_centroid + direction)
+        #    offset = filling_push_end - nearest_filling_centroid
+        #    offset = 30*(offset / np.linalg.norm(offset))
+        #    filling_push_start = np.array(nearest_filling_centroid - offset).astype(int)
 
-            vis = visualize_push(vis, filling_push_start, filling_push_end)
-        vis = visualize_push(vis, sparsest, densest)
+        #    vis = visualize_push(vis, filling_push_start, filling_push_end)
+        #vis = visualize_push(vis, sparsest, densest)
 
-        valid_actions = self.check_noodle_action_validity(image, sparsest, densest, nearest_filling_centroid, filling_push_end)
-        #print(valid_actions)
-        cv2.imshow('img', vis)
-        cv2.waitKey(0)
-        #cv2.imshow('img', minispanet_vis)
+        valid_actions = self.check_noodle_action_validity(image, sparsest, densest, filling_push_start, filling_push_end)
+        #cv2.imshow('img', vis)
         #cv2.waitKey(0)
         
-        return densest, sparsest, noodle_mask, valid_actions
+        return densest, sparsest, twirl_angle, filling_push_start, filling_push_end, valid_actions
 
     def detect_items(self, image):
         self.FOOD_CLASSES = [f.replace('fettucine', 'noodles') for f in self.FOOD_CLASSES]
@@ -309,7 +312,7 @@ class BiteAcquisitionInference:
         annotated_frame = box_annotator.annotate(scene=image.copy(), detections=detections, labels=labels)
 
         # NMS post process
-        print(f"Before NMS: {len(detections.xyxy)} boxes")
+        #print(f"Before NMS: {len(detections.xyxy)} boxes")
         nms_idx = torchvision.ops.nms(
             torch.from_numpy(detections.xyxy), 
             torch.from_numpy(detections.confidence), 
@@ -319,8 +322,7 @@ class BiteAcquisitionInference:
         detections.xyxy = detections.xyxy[nms_idx]
         detections.confidence = detections.confidence[nms_idx]
         detections.class_id = detections.class_id[nms_idx]
-        
-        print(f"After NMS: {len(detections.xyxy)} boxes")
+        #print(f"After NMS: {len(detections.xyxy)} boxes")
 
         # collect segment results from EfficientSAM
         result_masks = []
@@ -374,10 +376,13 @@ class BiteAcquisitionInference:
 
         refined_masks = []
 
-        #portion_weights = []
+        portion_weights = []
         for mask in individual_masks:
             refined_masks.append(cleanup_mask(mask))
-        #    portion_weights.append(mask_weight(mask))
+            portion_weights.append(mask_weight(mask))
+        #min_weight = min(portion_weights)
+        MIN_WEIGHT = 0.015
+        portion_weights = [max(1, p/MIN_WEIGHT) for p in portion_weights][:-1]
 
         #visualized_masks = []
         #for i, mask in enumerate(refined_masks):
@@ -389,15 +394,27 @@ class BiteAcquisitionInference:
         #    visualized_masks.append(vis)
 
         #keypoints = [sparsest, densest]
-        #min_weight = min(portion_weights)
-        #portion_weights = [p/min_weight for p in portion_weights]
 
         #return annotated_image, visualized_masks, labels, keypoints
-        return annotated_image, refined_masks, labels
+        return annotated_image, refined_masks, portion_weights, labels
+
+    def clean_labels(self, labels):
+        clean_labels = []
+        instance_count = {}
+        for label in labels:
+            label = label[:-4].strip()
+            clean_labels.append(label)
+            if label in instance_count:
+                instance_count[label] += 1
+            else:
+                instance_count[label] = 1
+        return clean_labels, instance_count
 
     def categorize_items(self, labels):
         categories = []
         prompt = """
+                 Acceptable outputs: ['noodles', 'meat/seafood', 'vegetable', 'dip', 'fruit', 'plate']
+
                  Input: 'noodles 0.69'
                  Output: 'noodles'
 
@@ -449,47 +466,110 @@ class BiteAcquisitionInference:
 
         return categories
 
-    def score_bites_preference(self):
+    def plan_efficient_bites(self, image, labels, categories):
+        efficiencies = {}
+        for label, category in zip(labels, categories):
+            if category in ['meat/seafood', 'vegetable', 'fruit', 'dip']:
+                efficiencies[label] = 1
+            elif category == 'plate':
+                continue
+            elif category == 'noodles':
+                #efficiency = self.task_plan(image)
+                efficiencies[label] = 3
+        return efficiencies
+
+    def get_manual_action(self, annotated_image, image, masks, labels, categories):
+        cv2.imshow('img', annotated_image)
+        cv2.waitKey(0)
+        idx = int(input('Which item (index) do you want to pick up?: %s'%labels))
+        print(categories[idx])
+        vis = image.copy()
+        if categories[idx] == 'noodles':
+            densest, sparsest, twirl_angle, filling_push_start, filling_push_end, _ = self.get_noodle_action(image, masks, labels, categories)
+            action = input('Twirl (t) or Push (p)')
+            if action == 't':
+                metadata = ('Twirl', {'point':densest, 'twirl_angle':twirl_angle})
+                vis = visualize_keypoints(vis, [densest])
+            else:
+                type_push = input('Filling (f) or noodles (n)?')
+                if type_push == 'f':
+                    metadata = ('Push', {'start':filling_push_start, 'end':filling_push_end})
+                    vis = visualize_push(vis, filling_push_start, filling_push_end)
+                elif type_push == 'n':
+                    metadata = ('Push', {'start':sparsest, 'end':densest})
+                    vis = visualize_push(vis, sparsest, densest)
+        elif categories[idx] in ['meat/seafood', 'vegetable', 'fruit']:
+            centroid = detect_centroid(masks[idx])
+            metadata = ('Skewer', {'point': centroid})
+            vis = visualize_keypoints(vis, [centroid])
+        elif categories[idx] == 'dip':
+            centroid = detect_centroid(masks[idx])
+            metadata = ('Dip', {'point': centroid})
+            vis = visualize_keypoints(vis, [centroid])
+        cv2.imshow('vis', vis)
+        cv2.waitKey(0)
+        return metadata
+
+    def score_preference_weight(self, preference):
         prompt = """
-                 Available Bites: [Noodles, Meat/Seafood, Vegetable]
-
                  Preference: Feed me alternating bites of spaghetti and meatballs
-                 History of bites: [Noodles, Meat/Seafood, Noodles, Meat/Seafood, Noodles]
-                 Preference weight, probability of next bite: 1.0, {'Meat/Seafood': 1.0, 'Noodles': 0.0, 'Vegetable': 0.0}
+                 Weight: 1.0
 
-                 Preference: If possible, feed me alternating bites of spaghetti and meatballs
-                 History of bites: [Noodles, Meat/Seafood, Noodles, Meat/Seafood]
-                 Preference weight, probability of next bite: 0.7, {'Meat/Seafood': 0.0, 'Noodles': 1.0, 'Vegetable': 0.0}
+                 Preference: Please don't feed me any meatballs
+                 Weight: 1.0
 
-                 Preference: Try to feed me only broccoli
-                 History of bites: []
-                 Preference weight, probability of next bite: 0.7, {'Meat/Seafood': 0.0, 'Noodles': 0.0, 'Vegetable': 1.0}
+                 Preference: I slightly prefer meatballs in the beginning, and finish with spaghetti
+                 Weight: 0.8
 
-                 Preference: I slightly prefer noodles
-                 History of bites: [Noodles, Vegetable, Noodles, Noodles, Meat/Seafood]
-                 Preference weight, probability of next bite: 0.6, {'Meat/Seafood': 0.1, 'Noodles': 0.8, 'Vegetable': 0.1}
+                 Preference: I like noodles better, but don't care too much
+                 Weight: 0.5
 
-                 Preference: Anything is fine
-                 History of bites: [Meat/Seafood, Noodles, Vegetable]
-                 Preference weight, probability of next bite: 0.0, {'Meat/Seafood': 0.33, 'Noodles': 0.33, 'Vegetable': 0.33}
-
-                 Preference: %s
-                 History of bites: %s
-                 Preference weight, probability of next bite:
+                 Preference: Anything is fine, random works
+                 Weight: 0.0
                  """
 
-        #preference = 'Feed me only meatballs'
-        #history = '[Meat/Seafood, Meat/Seafood]'
+    def score_bites_preference(self, preference, history, portions):
+        prompt = """
+                 Preference: Feed me alternating bites of spaghetti and meatballs
+                 History: []
+                 Portions available: ['noodles': 8.3, 'meatball': 3]
+                 Probability of next bite: {'noodles': 1.0, 'meatball': 0.0}
 
-        #preference = 'I slightly prefer meat'
-        #history = '[Meat/Seafood, Meat/Seafood]'
+                 Preference: I slightly prefer meatballs in the beginning, finish with spaghetti
+                 History: []
+                 Portions available: ['noodles': 10.5, 'meatball': 4]
+                 Probability of next bite: {'noodles': 0.1, 'meatball': 0.9}
 
-        preference = 'I kinda want to eat some veggies'
-        history = '[]'
+                 Preference: I slightly prefer meatballs in the beginning, finish with spaghetti
+                 History: ['meatball', 'meatball']
+                 Portions available: ['noodles': 10.5, 'meatball': 2]
+                 Probability of next bite: {'noodles': 0.1, 'meatball': 0.9}
+
+                 Preference: Feed me alternating bites of spaghetti and meatballs
+                 History: ['noodles', 'meatball', 'noodles']
+                 Portions available: ['noodles': 4.15, 'meatball': 2]
+                 Probability of next bite: {'noodles': 0.0, 'meatball': 1.0}
+
+                 Preference: Anything is fine, random works
+                 History: ['noodles', 'chicken', 'broccoli']
+                 Portions available: ['noodles': 6.2, 'chicken': 2, 'broccoli': 2]
+                 Probability of next bite: {'noodles': 0.33, 'chicken': 0.33, 'broccoli': 0.33}
+
+                 Preference: Anything is fine, random works
+                 History: ['noodles', 'chicken', 'broccoli', 'chicken', 'chicken']
+                 Portions available: ['noodles': 6.2, 'broccoli': 2]
+                 Probability of next bite: {'noodles': 0.5, 'broccoli': 0.5}
+
+                 Preference: %s
+                 History: %s
+                 Portions available: %s
+                 Probability of next bite:
+                 """
 
         chatbot_response = self.chat_with_openai(prompt%(preference, history))
         weight, probabilities = ast.literal_eval(chatbot_response)
         print(weight, probabilities)
+
 
 if __name__ == '__main__':
     inference_server = BiteAcquisitionInference()
@@ -506,16 +586,17 @@ if __name__ == '__main__':
 
         #items = inference_server.recognize_items(image)
         #inference_server.FOOD_CLASSES = items
+        annotated_image, masks, portion_weights, labels = inference_server.detect_items(image)
+        clean_labels = inference_server.clean_labels(labels[:-1])
 
-        annotated_image, masks, labels = inference_server.detect_items(image)
-        categories = inference_server.categorize_items(labels)
+        #categories = inference_server.categorize_items(labels)
+        #inference_server.get_noodle_action(image, masks, labels, categories)
+        #inference_server.get_manual_action(annotated_image, image, masks, labels, categories)
 
-        #print(labels)
-        #print(categories)
-        inference_server.get_noodle_action(image, masks, labels, categories)
-
-        if i > 3:
-            break
+        #efficiencies = inference_server.plan_efficient_bites(image, labels, categories)
+        #print(efficiencies)
+        #if i > 3:
+        #    break
 
         #cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_all.jpg'%(i)), annotated_image)
         #for j in range(len(masks)):
