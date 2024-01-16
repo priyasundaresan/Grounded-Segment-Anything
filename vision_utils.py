@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 
+from scipy.spatial import Delaunay
+
 import torch
 from torchvision.transforms import ToTensor
 
@@ -79,6 +81,17 @@ def nearest_neighbor(points, target_point):
     dists, idxs = neigh.kneighbors(np.array(target_point).reshape(1,-1), 1, return_distance=True)
     return points[idxs.squeeze()]
 
+def nearest_point_to_mask(points, mask):
+    ys, xs = np.where(mask > 0)
+    if not len(ys):
+        return px
+    mask_pixels = np.vstack((xs,ys)).T
+    neigh = NearestNeighbors()
+    neigh.fit(mask_pixels)
+    dists, idxs = neigh.kneighbors(np.array(points), 1, return_distance=True)
+    min_dist_idx = dists.argmin()
+    return points[min_dist_idx]
+
 def proj_pix2mask(px, mask):
     ys, xs = np.where(mask > 0)
     if not len(ys):
@@ -100,7 +113,6 @@ def detect_densest(mask, kernel=(60,60)):
     return densest
 
 def detect_sparsest(mask, densest):
-    cv2.imwrite('test.png', mask)
     contours,hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     length = len(contours)
     #cont = np.vstack(([c for c in contours if cv2.contourArea(c) > 100]))
@@ -114,6 +126,57 @@ def detect_sparsest(mask, densest):
     furthest = proj_pix2mask(np.array(furthest), mask)
     furthest = (int(furthest[0]), int(furthest[1]))
     return furthest, hull
+
+def detect_filling_push(dense_center, furthest, fillings, hull):
+    dense_center = np.array(dense_center)
+    furthest = np.array(furthest)
+    delaunay = Delaunay(hull)
+    fillings_in_hull = delaunay.find_simplex(fillings) >= 0
+    fillings_in_hull = np.array(fillings)[fillings_in_hull]
+
+    if len(fillings_in_hull) == 0:
+        print("No fillings in hull. Returning...")
+        return None, None
+
+    # print('fillings_in_hull', fillings_in_hull)
+
+    filling_to_push = None
+    min_dist = float('inf')
+    num_samples = 100
+    dense_line_segment_2d = np.linspace(dense_center, furthest, num_samples)
+    for filling in fillings_in_hull:
+        dists = np.linalg.norm(dense_line_segment_2d - filling, axis=1)
+        if np.min(dists) < min_dist:
+            min_dist = np.min(dists)
+            filling_to_push = filling
+
+    num_samples = 100
+    dense_hull_points_2d = np.vstack([np.linspace(hull[i], hull[i+1], num_samples) for i in range(len(hull)-1)])
+
+    cos_angles = []
+    for dense_hull_point_2d in dense_hull_points_2d:
+        line_1 = furthest - dense_center
+        line_2 = filling_to_push - dense_hull_point_2d
+        cos_angle = np.dot(line_1, line_2) / (np.linalg.norm(line_1) * np.linalg.norm(line_2))
+        cos_angles.append(cos_angle)
+    cos_angles = np.array(cos_angles)
+    cos_angles = np.abs(cos_angles)
+    print('cos_angles', cos_angles)
+    # select the points with cos less than 0.1
+    dense_hull_points_2d = dense_hull_points_2d[cos_angles < 0.1]
+    # find nearest point to filling_to_push
+    neigh = NearestNeighbors()
+    neigh.fit(dense_hull_points_2d)
+    match_idxs = neigh.kneighbors([filling_to_push], len(dense_hull_points_2d), return_distance=False)
+    filling_to_push_target_2d = dense_hull_points_2d[match_idxs.squeeze().tolist()[0]]
+    filling_to_push_target_2d = filling_to_push_target_2d.astype(int)
+
+    # OFFSET CORRECTION
+    offset = filling_to_push_target_2d - filling_to_push
+    offset = 35*(offset / np.linalg.norm(offset))
+    filling_to_push = np.array(filling_to_push - offset).astype(int)
+    print("filling_to_push_target_2d", filling_to_push_target_2d)
+    return filling_to_push, filling_to_push_target_2d
 
 def detect_centroid(mask):
     cX, cY = 0, 0
