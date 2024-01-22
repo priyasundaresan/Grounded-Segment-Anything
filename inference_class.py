@@ -127,7 +127,7 @@ class BiteAcquisitionInference:
 
         self.CATEGORIES = ['meat/seafood', 'vegetable', 'noodles', 'fruit', 'dip', 'plate']
 
-        self.api_key = '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'
+        self.api_key = ''
 
         self.gpt4v_client = GPT4Vision(self.api_key, '/scr/priyasun/Grounded-Segment-Anything/prompt')
         self.client = OpenAI(api_key=self.api_key)
