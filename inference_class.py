@@ -118,7 +118,8 @@ class BiteAcquisitionInference:
         self.EFFICIENT_SAM_CHECKPOINT_PATH = "/scr/priyasun/Grounded-Segment-Anything/efficientsam_s_gpu.jit"
         self.efficientsam = torch.jit.load(self.EFFICIENT_SAM_CHECKPOINT_PATH)
 
-        self.FOOD_CLASSES = ["noodles", "meatball", "shrimp", "chicken", "vegetable", "broccoli"]
+        #self.FOOD_CLASSES = ["noodles", "meatball", "shrimp", "chicken", "vegetable", "broccoli"]
+        self.FOOD_CLASSES = ["mashed potato", "sausage"]
         self.BOX_THRESHOLD = 0.22
         self.TEXT_THRESHOLD = 0.2
         #self.NMS_THRESHOLD = 0.65
@@ -126,7 +127,7 @@ class BiteAcquisitionInference:
 
         self.CATEGORIES = ['meat/seafood', 'vegetable', 'noodles', 'fruit', 'dip', 'plate']
 
-        self.api_key = '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'
+        self.api_key = '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'
 
         self.gpt4v_client = GPT4Vision(self.api_key, '/scr/priyasun/Grounded-Segment-Anything/prompt')
         self.client = OpenAI(api_key=self.api_key)
@@ -207,9 +208,25 @@ class BiteAcquisitionInference:
         pred_rot = math.degrees(pred_rot)
         return pred_rot, int(global_x), int(global_y), result
 
+    def check_semisolid_action_validity(self, image, sparsest, densest, filling_push_start, filling_push_end):
+        if filling_push_start is None and filling_push_end is None:
+            return ['Acquire'], np.zeros_like(image)
+        H,W,C = image.shape
+        vis = np.zeros((H,W))
+
+        filling_push_mask = visualize_keypoints(vis.copy(), [filling_push_start], radius=20)
+        scoop_mask = visualize_keypoints(vis.copy(), [densest], radius=20)
+
+        valid_actions = ['Push Filling']
+        if not (np.any(cv2.bitwise_and(filling_push_mask, scoop_mask))):
+            valid_actions.append('Acquire')
+
+        vis = np.hstack((filling_push_mask, scoop_mask))
+        return valid_actions, vis
+
     def check_noodle_action_validity(self, image, sparsest, densest, filling_push_start, filling_push_end):
         if filling_push_start is None and filling_push_end is None:
-            return ['Twirl', 'Group'], np.zeros_like(image)
+            return ['Acquire', 'Group'], np.zeros_like(image)
         H,W,C = image.shape
         vis = np.zeros((H,W))
 
@@ -219,7 +236,7 @@ class BiteAcquisitionInference:
 
         valid_actions = ['Push Filling']
         if not (np.any(cv2.bitwise_and(filling_push_mask, twirl_mask))):
-            valid_actions.append('Twirl')
+            valid_actions.append('Acquire')
         if not (np.any(cv2.bitwise_and(filling_push_mask, group_mask))):
             valid_actions.append('Group')
 
@@ -233,18 +250,68 @@ class BiteAcquisitionInference:
         DENSITY_THRESH = 0.8
         ENTROPY_THRESH = 9
 
-        if density > DENSITY_THRESH and 'Twirl' in valid_actions:
-            return 'Twirl'
+        if density > DENSITY_THRESH and 'Acquire' in valid_actions:
+            return 'Acquire'
         elif entropy > ENTROPY_THRESH and 'Group' in valid_actions:
             return 'Group'
         elif 'Push Filling' in valid_actions:
             return 'Push Filling'
-        return 'Twirl'
+        return 'Acquire'
+
+    def get_scoop_action(self, image, masks, labels, categories):
+        H,W,C = image.shape
+        plate_mask = masks[-2]
+        blue_mask = masks[-1]
+        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        semisolid_idx = None
+        semisolid_mask = None
+        for i, (label, mask) in enumerate(zip(labels, masks)):
+            if 'mashed potato' in labels[i] or 'risotto' in labels[i] or 'oatmeal' in labels[i]:
+                semisolid_idx = i
+                semisolid_mask = mask
+        semisolid_mask = cv2.bitwise_and(plate_mask, semisolid_mask)
+        semisolid_mask = cv2.bitwise_and(cv2.bitwise_not(blue_mask), semisolid_mask)
+        semisolid_mask = outpaint_masks(semisolid_mask.copy(), masks[:semisolid_idx] + masks[semisolid_idx+1:-2])
+
+        # Detect densest and furthest points
+        densest, heatmap = detect_densest(semisolid_mask)
+        sparsest, sparsest_candidates = detect_sparsest(semisolid_mask, densest)
+
+        filling_centroids = []
+        filling_push_start = None
+        filling_push_end = None
+
+        for i, (category, mask) in enumerate(zip(categories, masks)):
+            if category in ['meat/seafood', 'vegetable']:
+                centroid = detect_centroid(masks[i])
+                filling_centroids.append(centroid)
+        
+        vis = image.copy()
+        if len(filling_centroids):
+            filling_push_start, filling_push_end = detect_filling_push(densest, sparsest, filling_centroids, sparsest_candidates)
+
+        heatmap = cv2.bitwise_and(heatmap, semisolid_mask)
+        density = calculate_heatmap_density(heatmap)
+        entropy = calculate_heatmap_entropy(heatmap)
+        heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+        heatmap = cv2.addWeighted(image, 0.55, heatmap, 0.45, 0)
+
+        valid_actions, valid_actions_vis = self.check_semisolid_action_validity(image, sparsest, densest, filling_push_start, filling_push_end)
+        action = self.determine_action(density, entropy, valid_actions)
+
+        heatmap = cv2.putText(heatmap, 'Density Score: %.2f'%(density), (20,40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2)
+        heatmap = cv2.putText(heatmap, 'Entropy Score: %.2f'%(entropy), (20,80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2)
+        heatmap = cv2.putText(heatmap, 'Action: %s'%(action), (20,460), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+
+        #cv2.imshow('img', vis)
+        #cv2.waitKey(0)
+        
+        return densest, sparsest, filling_push_start, filling_push_end, valid_actions, valid_actions_vis, heatmap, action
 
     def get_noodle_action(self, image, masks, labels, categories):
         # Extract mask of only noodles
         H,W,C = image.shape
-        plate_mask = masks[-1]
+        plate_mask = masks[-2]
         img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         inp = self.seg_net_transform(img_rgb).to(device=self.DEVICE)
         logits = self.seg_net(inp)
@@ -258,7 +325,7 @@ class BiteAcquisitionInference:
                 noodle_mask = mask
         noodle_mask = cv2.bitwise_and(plate_mask, noodle_mask)
         noodle_mask = cv2.bitwise_and(noodle_vapors_mask, noodle_mask)
-        noodle_mask = outpaint_masks(noodle_mask.copy(), masks[:noodle_idx] + masks[noodle_idx+1:-1])
+        noodle_mask = outpaint_masks(noodle_mask.copy(), masks[:noodle_idx] + masks[noodle_idx+1:-2])
 
         # Detect densest and furthest points
         densest, heatmap = detect_densest(noodle_mask)
@@ -361,12 +428,12 @@ class BiteAcquisitionInference:
         noodle_idxs = []
         for i in range(len(labels)):
             label = labels[i]
-            if 'noodle' in label:
+            if 'noodle' in label or 'mashed' in label:
                 noodle_idxs.append(i)
-            prob = float(label[-4:].strip())
-            if prob > max_prob:
-                max_prob_noodle_idx = i
-                max_prob = prob
+                prob = float(label[-4:].strip())
+                if prob > max_prob:
+                    max_prob_noodle_idx = i
+                    max_prob = prob
         if len(noodle_idxs) > 1:
             noodle_idxs.remove(max_prob_noodle_idx)
             idxs = [i for i in range(len(detections)) if not i in noodle_idxs]
@@ -383,7 +450,7 @@ class BiteAcquisitionInference:
                               class_id = np.array(detections.class_id[i]).reshape((1,)))
             mask = mask_annotator.annotate(scene=mask, detections=d)
             binary_mask = np.zeros((H,W)).astype(np.uint8)
-            if 'noodle' in labels[i]:
+            if 'noodle' in labels[i] or 'mashed' in labels[i]:
                 if noodle_idx is None:
                     noodle_idx = i
                 else:
@@ -401,6 +468,8 @@ class BiteAcquisitionInference:
 
         individual_masks.append(plate_mask)
         labels.append('blue plate')
+        individual_masks.append(blue_mask)
+        labels.append('blue')
 
         refined_masks = []
 
@@ -429,7 +498,7 @@ class BiteAcquisitionInference:
     def categorize_items(self, labels):
         categories = []
         prompt = """
-                 Acceptable outputs: ['noodles', 'meat/seafood', 'vegetable', 'dip', 'fruit', 'plate']
+                 Acceptable outputs: ['noodles', 'meat/seafood', 'vegetable', 'dip', 'fruit', 'plate', 'semisolid']
 
                  Input: 'noodles 0.69'
                  Output: 'noodles'
@@ -455,6 +524,18 @@ class BiteAcquisitionInference:
                  Input: 'ranch 0.24'
                  Output: 'dip'
 
+                 Input: 'mashed potato 0.43'
+                 Output: 'semisolid'
+
+                 Input: 'mashed potato 0.30'
+                 Output: 'semisolid'
+
+                 Input: 'risotto 0.40'
+                 Output: 'semisolid'
+
+                 Input: 'oatmeal 0.43'
+                 Output: 'semisolid'
+
                  Input: 'caramel 0.28'
                  Output: 'dip'
 
@@ -463,6 +544,12 @@ class BiteAcquisitionInference:
 
                  Input: 'strawberry 0.57'
                  Output: 'fruit'
+
+                 Input: 'blue'
+                 Output: 'plate'
+
+                 Input: 'blue'
+                 Output: 'plate'
 
                  Input: 'blue plate'
                  Output: 'plate'
@@ -598,7 +685,8 @@ if __name__ == '__main__':
     #efficiencies = inference_server.plan_efficient_bites(image, labels, categories)
     #print(efficiencies)
 
-    EVAL_DIR = 'filling_noodles'
+    #EVAL_DIR = 'filling_noodles'
+    EVAL_DIR = 'mashed_potatoes'
     SOURCE_IMAGE_DIR = '%s/images'%EVAL_DIR
     OUTPUT_DIR = 'outputs'
 
@@ -612,36 +700,39 @@ if __name__ == '__main__':
     correct_count = 0
 
     for i, fn in enumerate(os.listdir(SOURCE_IMAGE_DIR)):
-    #for i in [11]:
-        try:
-            SOURCE_IMAGE_PATH = os.path.join(SOURCE_IMAGE_DIR, '%d.jpg'%(i+1))
-            image = cv2.imread(SOURCE_IMAGE_PATH)
-            image = resize_to_square(image, 480)
+    #for i in [9]:
+        print(i)
+        SOURCE_IMAGE_PATH = os.path.join(SOURCE_IMAGE_DIR, '%d.jpg'%(i+1))
+        image = cv2.imread(SOURCE_IMAGE_PATH)
+        image = resize_to_square(image, 480)
 
-            annotated_image, masks, portion_weights, labels = inference_server.detect_items(image)
-            #for j in range(len(masks)):
-            #    cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_%s.jpg'%(i,labels[j])), masks[j])
+        annotated_image, masks, portion_weights, labels = inference_server.detect_items(image)
+        #for j in range(len(masks)):
+        #    if 'blue' == labels[j]:
+        #        cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_%s.jpg'%(i,labels[j])), masks[j])
 
-            categories = inference_server.categorize_items(labels)
-            #cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_all.jpg'%(i)), annotated_image)
+        categories = inference_server.categorize_items(labels)
+        #cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_all.jpg'%(i)), annotated_image)
 
-            result = inference_server.get_noodle_action(image, masks, labels, categories)
-            valid_actions_vis = result[-3]
-            heatmap = result[-2]
-            action = result[-1]
-            gt_action = gt_actions[i]
-            if gt_action in action.lower():
-                correct_count += 1
-            total_count += 1
-            print('Accuracy', correct_count/total_count)
+        #result = inference_server.get_noodle_action(image, masks, labels, categories)
+        result = inference_server.get_scoop_action(image, masks, labels, categories)
+        valid_actions_vis = result[-3]
+        heatmap = result[-2]
+        action = result[-1]
 
-            #cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_valid.jpg'%(i)), valid_actions_vis)
+        gt_action = gt_actions[i]
+        mapping = {'Acquire': 'Scoop', 'Push Filling': 'Push Filling', 'Group': 'Group'}
+        action = mapping[action]
+        if gt_action in action.lower():
+            correct_count += 1
+        total_count += 1
+        print('Accuracy', correct_count/total_count)
 
-            #if 'Probably' not in gt_action:
-            #    if action in gt_action:
-            #        correct_count += 1
-            #    total_count += 1
-            #    print('Accuracy', correct_count/total_count)
-            cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_noodles.jpg'%(i)), np.hstack((image, heatmap)))
-        except:
-            continue
+        #cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_valid.jpg'%(i)), valid_actions_vis)
+
+        #if 'Probably' not in gt_action:
+        #    if action in gt_action:
+        #        correct_count += 1
+        #    total_count += 1
+        #    print('Accuracy', correct_count/total_count)
+        cv2.imwrite(os.path.join(OUTPUT_DIR, '%02d_action.jpg'%(i)), np.hstack((image, heatmap)))

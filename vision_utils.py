@@ -7,6 +7,36 @@ import torch
 from torchvision.transforms import ToTensor
 
 from sklearn.neighbors import NearestNeighbors
+from scipy.stats import entropy
+
+
+def resize_to_square(image, output_size=None):
+    if image is None:
+        raise ValueError("Could not read the image.")
+    height, width = image.shape[:2]
+    # Determine the smaller dimension
+    min_dim = min(width, height)
+    # Calculate crop coordinates
+    start_x = width // 2 - min_dim // 2
+    start_y = height // 2 - min_dim // 2
+    # Crop to a square
+    square_image = image[start_y:start_y + min_dim, start_x:start_x + min_dim]
+    # Resize if an output size is specified
+    if output_size is not None:
+        square_image = cv2.resize(square_image, (output_size, output_size))
+    return square_image
+
+def calculate_heatmap_density(heatmap):
+    return heatmap.max()/255
+
+def calculate_heatmap_entropy(heatmap):
+    # Normalize the heatmap to sum to 1 (like a probability distribution)
+    heatmap_normalized = heatmap / np.sum(heatmap)
+    # Flatten the heatmap
+    heatmap_flattened = heatmap_normalized.flatten()
+    # Calculate the entropy
+    heatmap_entropy = entropy(heatmap_flattened)
+    return heatmap_entropy
 
 def efficient_sam_box_prompt_segment(image, pts_sampled, model):
     bbox = torch.reshape(torch.tensor(pts_sampled), [1, 1, 2, 2])
@@ -44,7 +74,6 @@ def outpaint_masks(target_mask, other_masks):
 
 def detect_plate(img):
     H,W,C = img.shape
-    print("Detected plate H,W,C", H,W,C)
     img_orig = img.copy()
     img = cv2.resize(img, (W//2, H//2))
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -66,8 +95,8 @@ def detect_plate(img):
         return plate_small_mask
 
 def detect_blue(image):
-    lower_blue = np.array([60,30,15]) 
-    upper_blue = np.array([255,150,75]) 
+    lower_blue = np.array([45,30,15]) 
+    upper_blue = np.array([255,150,80]) 
     # Here we are defining range of bluecolor in HSV 
     # This creates a mask of blue coloured  
     # objects found in the frame. 
@@ -103,19 +132,22 @@ def proj_pix2mask(px, mask):
     projected_px = mask_pixels[idxs.squeeze()]
     return projected_px
 
-def detect_densest(mask, kernel=(60,60)):
+def get_density_heatmap(mask, kernel):
     # Find desired pixel in densest_masked_noodles
     kernel = np.ones(kernel, np.float32)/kernel[0]**2
     dst = cv2.filter2D(mask, -1, kernel)
-    pred_y, pred_x = np.unravel_index(dst.argmax(), dst.shape)
+    return dst
+
+def detect_densest(mask, kernel=(60,60)):
+    heatmap = get_density_heatmap(mask, kernel)
+    pred_y, pred_x = np.unravel_index(heatmap.argmax(), heatmap.shape)
     densest = proj_pix2mask((pred_x, pred_y), mask)
     densest = (int(densest[0]), int(densest[1]))
-    return densest
+    return densest, heatmap
 
 def detect_sparsest(mask, densest):
     contours,hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     length = len(contours)
-    #cont = np.vstack(([c for c in contours if cv2.contourArea(c) > 100]))
     cont = np.vstack((contours))
     hull = cv2.convexHull(cont)
     hull = hull.reshape(len(hull), 2).astype(int)
@@ -161,7 +193,6 @@ def detect_filling_push(dense_center, furthest, fillings, hull):
         cos_angles.append(cos_angle)
     cos_angles = np.array(cos_angles)
     cos_angles = np.abs(cos_angles)
-    print('cos_angles', cos_angles)
     # select the points with cos less than 0.1
     dense_hull_points_2d = dense_hull_points_2d[cos_angles < 0.1]
     # find nearest point to filling_to_push
@@ -216,7 +247,7 @@ def cleanup_mask(mask, blur_kernel_size=(5, 5), threshold=127, erosion_size=3):
     return eroded
 
 def visualize_push(image, start, end):
-    vis = cv2.arrowedLine(image.copy(), tuple(start), tuple(end), (255,255,255), 3)
+    vis = cv2.arrowedLine(image.copy(), tuple(start), tuple(end), (255,255,255), 20)
     return vis
 
 def visualize_keypoints(image, keypoints, color=(255,255,255), radius=8):
